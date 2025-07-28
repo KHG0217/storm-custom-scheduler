@@ -45,9 +45,9 @@ public class TestTopology {
         TestBolt1 bolt1 = new TestBolt1();
         TestBolt2 bolt2 = new TestBolt2();
 
-        builder.setSpout(SPOUT_ID, spout, numSpout);
-        builder.setBolt(BOLT1, bolt1, numBolt1).shuffleGrouping(SPOUT_ID);
-        builder.setBolt(BOLT2, bolt2, numBolt2).shuffleGrouping(BOLT1);
+        builder.setSpout(SPOUT_ID, spout, numSpout * numWorker);
+        builder.setBolt(BOLT1, bolt1, numBolt1 * numWorker).shuffleGrouping(SPOUT_ID);
+        builder.setBolt(BOLT2, bolt2, numBolt2 * numWorker).shuffleGrouping(BOLT1);
 
         Config config = new Config();
         config.setNumWorkers(numWorker);
