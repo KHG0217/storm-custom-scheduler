@@ -1,18 +1,11 @@
 package com.khg.storm;
-
-import org.apache.storm.generated.Assignment;
-import org.apache.storm.generated.TopologyStatus;
 import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.scheduler.*;
 import org.apache.storm.scheduler.resource.ResourceAwareScheduler;
-import org.checkerframework.checker.units.qual.A;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.lang.reflect.Array;
 import java.util.*;
 import java.util.stream.Collectors;
-import org.apache.storm.Config;
 
 public class CustomTestClass implements IScheduler {
     private static final Logger LOG = LoggerFactory.getLogger(CustomTestClass.class);
@@ -77,10 +70,7 @@ public class CustomTestClass implements IScheduler {
             Map<String, Set<String>> supervisorToGroups = getSupervisorToGroups(cluster, topologies);
 
             // 해당 그룹이 아직 실행되지 않은 Supervisor만 필터
-
-            // 현재 클러스터의 모든 Supervisor 객체들을 가져옴
-            // -> Map<String, SueprvisorDetails> 에서 value만 가져옴
-            List<SupervisorDetails> candidateSupervisors = cluster.getSupervisors().values().stream()
+            List<SupervisorDetails> candidateSupervisors = cluster.getSupervisors().values().stream()    // 현재 클러스터의 모든 Supervisor 객체들을 가져옴
                     .filter(s -> {
                         Set<String> groups =  supervisorToGroups.get(s.getId()); // 현재 Supervisor가 실행중인 group 목록 가져오기
                         if(groups == null) { // supervisorToGroups에 해당 supervisor가 없다면 아직 아무 group도 실행 안한 supervisor
@@ -94,103 +84,145 @@ public class CustomTestClass implements IScheduler {
                 LOG.info("No available supervisor for group: {}, topologt: {}",group,topologyName);
                 continue;
             }
+            LOG.info("candidateSupervisors: ");
+            candidateSupervisors.forEach(k -> LOG.info("Supervisor: {}",k));
+
+            // 중복 방지용 Set 추가
+            Set<String> assignedSupervisors = new HashSet<>();
 
             // 가능한 Superviosr 중에서 free slot이 있는 Superviosr만 추출
             List<WorkerSlot> availableSlots = new ArrayList<>();
             for(SupervisorDetails supervisor: candidateSupervisors) {
+                if (assignedSupervisors.contains(supervisor.getId())) {
+                    LOG.warn("Supervisor {} already assigned in this scheduling cycle. Skipping...", supervisor.getId());
+                    continue;
+                }
+
                 Set<Integer> usedPorts = cluster.getUsedPorts(supervisor);
+                LOG.info("usePorts: " + usedPorts);
                 for(Integer port : supervisor.getAllPorts()) {
                     if(!usedPorts.contains(port)) {
                         availableSlots.add(new WorkerSlot(supervisor.getId(), port));
+                        LOG.info("사용가능: {},{}",supervisor.getHost(),port );
                     }
                 }
+                // 한 번이라도 슬롯이 추가되면 해당 Supervisor는 이번 루프에서 사용했다고 기록
+                if (!availableSlots.isEmpty()) {
+                    assignedSupervisors.add(supervisor.getId());
+                    LOG.info("assignedSupervisors add: " + supervisor.getId());
+                }
             }
+
             if(availableSlots.isEmpty()) {
                 LOG.info("No free worker slots for group: {}, topology: {}", group, topologyName);
                 continue;
             }
-
-            // 할당할 executor
-
-
             try {
-                int numWorkers = topology.getNumWorkers(); // 사용자가 설정한 Config.setNumWorkers()값
-
                 /**
                  * cluster.getNeedsSchedulingComponentToExecutors(topology)
                  * Cluster 객체에서 topology에 대해 아직 실행되지 않은 componet -> executor 목록을 리턴
                  * 반환형 : Map<String, Collection<ExecutorDetails>>
                  *     - key: component 이름 (예: spout1, bolt1 등)
                  *     - value: 그 component에 연결된 executor들 (하나의 component는 여러 executor을 가질 수 있음)
-                 *
-                 * flatMap(Collection::stream)
-                 * 중첩된 컬렉션을 하나로 풀어주는 역활, List<List<X>> -> List<X>와 같음
-                 *
-                 * 예)
-                 * getNeedsSchedulingComponentToExecutors(topology) 아래의 예시라고 가정
-                 * {
-                 *   "spout1": [Executor(1,1), Executor(2,2)],
-                 *   "bolt1":  [Executor(3,3)]
-                 * }
-                 *
-                 * .values()는
-                 * [
-                 *   [Executor(1,1), Executor(2,2)],
-                 *   [Executor(3,3)]
-                 * ]
-                 *
-                 * -> .flatMap(Collection::stream)으로 펴면
-                 * [Executor(1,1), Executor(2,2), Executor(3,3)]
-                 *
-                 * 즉 해당 로직은 스케줄링이 필요한 모든 executor 목록을 하나의 List로 만드는 로직
                  */
-                List<ExecutorDetails> executors = cluster.getNeedsSchedulingComponentToExecutors(topology)
-                        .values().stream().flatMap(Collection::stream).collect(Collectors.toList());
+
+                Map<String, ? extends Collection<ExecutorDetails>> executors =
+                        cluster.getNeedsSchedulingComponentToExecutors(topology);
+                LOG.info("executors : " + executors.entrySet());
+
+                Map<String, Queue<ExecutorDetails>> componentQueues = new HashMap<>();
+                // component → queue 형태로 전환
+                for (Map.Entry<String, ? extends Collection<ExecutorDetails>> entry : executors.entrySet()) {
+                    componentQueues.put(entry.getKey(), new LinkedList<>(entry.getValue()));
+                }
+                int targetWorkerCount = topology.getNumWorkers(); // topology에 단긴 worker수
+                LOG.info("targetWorkerCount: " + targetWorkerCount);
 
                 /**
-                 * Executor 수가 Worker 수보다 적을 수 있으므로, 실질적으로 나눌 수 있는 Worker수는 더 작은 수를 기준으로함
-                 * 예: Worker = 3, Executor = 2 -> 실제 Worker는 2개만 필요
+                 * componet 필드별로 perworker할당
                  */
-                int actualWorkerCount = Math.min(numWorkers, executors.size());
-                // 현재 할당 가능한 슬롯 개수 확인
-                int slotCount = availableSlots.size();
-                // 실제 할당 가능한 Worker 개수는 슬롯 수와 실 Worker수 중 최소값
-                int assignCount = Math.min(actualWorkerCount, slotCount);
-
-                // Executor를 Worker 단위로 나눌 때, 몇 개씩 배정할지 계산 여기선 실 Worker수로 나눔
-                int execPerWorker = executors.size() / assignCount;
-                // 나머지는 앞쪽 슬롯들에 하나씩 추가 배정하는 로직에서 사용
-                int remainder = executors.size() % assignCount;
-
-                // Executor를 리스트를 잘라 쓰기 위한 시작 인덱스
-                int fromIndex = 0;
-                // 스케줄링 중 이미 사용된 Supervisor ID를 기억하는 Set
-                Set<String> assignedSupervisors = new HashSet<>();
-
-                for (WorkerSlot slot : availableSlots) {
-                    String nodeId = slot.getNodeId();
-
-                    // 이미 이번 스케줄링에서 사용된 Supervisor는 스킵
-                    if (assignedSupervisors.contains(nodeId)) {
-                        LOG.warn("Supervisor {} already used during scheduling. Skipping...", nodeId);
-                        continue;
-                    }
-                    // 할당할 Worker 수를 다 채우면 루프 종료
-                    if (assignCount <= 0) break;
-
-                    // execPerWorker 만큼 Executor  잘라서 가져옴
-                    // 만약  remainder > 0 이면 하나 더 가져감 (앞쪽 슬롯이 더 많이 가져가는 로직)
-                    int toIndex = fromIndex + execPerWorker + (remainder-- > 0 ? 1 : 0);
-                    List<ExecutorDetails> subExecutors = executors.subList(fromIndex, toIndex);
-
-                    cluster.assign(slot, topology.getId(), subExecutors);
-                    LOG.info("Assigned executors [{} - {}) to slot: {}", fromIndex, toIndex, slot);
-
-                    assignedSupervisors.add(nodeId);
-                    fromIndex = toIndex;
-                    assignCount--;
+                Map<String ,Integer> perWorkerCount = new HashMap<>();
+                for(Map.Entry<String, Queue<ExecutorDetails>> entry : componentQueues.entrySet()) {
+                    String component = entry.getKey();
+                    int totalExecutors = entry.getValue().size();
+                    int perWorker = (int) Math.ceil((double) totalExecutors / targetWorkerCount);
+                    perWorkerCount.put(component, perWorker);
+                    LOG.info("perWorkerCount: {}", perWorkerCount.entrySet());
                 }
 
+                // Supervisor 기준으로 묶기
+                Map<String, List<WorkerSlot>> supervisorToSlots = new HashMap<>();
+                for (WorkerSlot slot : availableSlots) {
+                    supervisorToSlots.computeIfAbsent(slot.getNodeId(), k -> new ArrayList<>()).add(slot);
+                    LOG.info("supervisorToSlots: " + supervisorToSlots.entrySet());
+                }
+
+                /**
+                 * supervisorToSlots 예시
+                 * supervisorToSlots: [
+                 *   55200935-3a72-47cc-9b1c-3b7a5e39d8aa-10.34.32.189 = [ //supervisor
+                 *       55200935-3a72-47cc-9b1c-3b7a5e39d8aa-10.34.32.189:6700, supervisor:port1
+                 *       55200935-3a72-47cc-9b1c-3b7a5e39d8aa-10.34.32.189:6701, supervisor:port2
+                 *       55200935-3a72-47cc-9b1c-3b7a5e39d8aa-10.34.32.189:6702 supervisor:port3
+                 *   ],
+                 *   905b74d6-702d-435d-8c5c-840c65945541-10.34.31.176 = [
+                 *       905b74d6-702d-435d-8c5c-840c65945541-10.34.31.176:6700,
+                 *       905b74d6-702d-435d-8c5c-840c65945541-10.34.31.176:6701,
+                 *       905b74d6-702d-435d-8c5c-840c65945541-10.34.31.176:6702
+                 *   ],
+                 *   0093d165-df4d-4684-abd7-89bb16625e61-10.33.30.89 = [
+                 *       0093d165-df4d-4684-abd7-89bb16625e61-10.33.30.89:6700,
+                 *       0093d165-df4d-4684-abd7-89bb16625e61-10.33.30.89:6701,
+                 *       0093d165-df4d-4684-abd7-89bb16625e61-10.33.30.89:6702
+                 *   ]
+                 * ]
+                 */
+                List<WorkerSlot> selectedSlots = supervisorToSlots.values().stream()
+                        .filter(slots -> !slots.isEmpty())
+                        .limit(targetWorkerCount)  // 워커 수만큼 제한
+                        /**
+                         * targetWorkerCount > 사용가능 Superviosr수 일 경우
+                         * 예)
+                         * targetWorkerCount: 4개
+                         * Superviosr수: 3대
+                         * 실제 할당되는 워커 슬롯은 3개
+                         * 이때 Storm은 모든 executor가 worker에 배치되지 않으면 "needsScheduling" 상태로 토폴로지를 유지하게 됨
+                         * 스케줄러가 실시간으로 감지하여 할당할 수 있는 워커 수가 되어 할당이 완료될때 까지 재시도
+                         *
+                         * 관련 스톰 설정
+                         * nimbus.monitor.freq.secs	N :
+                         * Nimbus가 클러스터 상태(할당되지 않은 Executor 포함)를 확인하고
+                         * 재스케줄링을 시도하는 주기(초 단위). 워커가 부족하면 N초마다 반복 시도
+                         *
+                         */
+                        .map(slots -> slots.get(0)) // 각 supervisor에서 첫 번째 슬롯만
+                        .collect(Collectors.toList());
+                LOG.info("selectedSlots: " + selectedSlots);
+
+                for (int i = 0; i < selectedSlots.size(); i++) {
+                    List<ExecutorDetails> executorList = new ArrayList<>();
+
+                    for(Map.Entry<String, Queue<ExecutorDetails>> entry : componentQueues.entrySet()) {
+                        String component = entry.getKey();
+                        LOG.info("component: " + component);
+                        Queue<ExecutorDetails> queue = entry.getValue();
+                        LOG.info("queue: " + queue);
+                        int perWorker = perWorkerCount.getOrDefault(component, 1);
+
+                        for(int j = 0; j < perWorker; j++) {
+                            ExecutorDetails exec = queue.poll();
+                            if(exec != null) {
+                                executorList.add(exec);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if(!executorList.isEmpty()) {
+                        cluster.assign(selectedSlots.get(i), topology.getId(), executorList);
+                        LOG.info("Assigned to slot {}: {}, {}",selectedSlots.get(i), executorList, topology.getId());
+                    }
+                }
             } catch (Exception e) {
                 LOG.error("Failed to assign topology: {} due to error", topologyName, e);
             }
@@ -215,29 +247,33 @@ public class CustomTestClass implements IScheduler {
     }
 
     /**
+     * 클러스터에서 Supervisor별로 어떤 Group의 Topology들이 실행중인지 매핑 정보를 반환
      *
+     * 동일 그룹 Topology가 이미 특정 Supervisor에서 실행 중인 경우
+     * 새로운 Topology를 해당 Supervisor에 배치하지 않도록 판단 근거로 활용
      * @param cluster
      * @param topologies
      * @return
      */
     private Map<String, Set<String>> getSupervisorToGroups (Cluster cluster, Topologies topologies) {
-       Map<String, Set<String>> supervisorToGroups = new HashMap<>();
+        // Supervisor ID를 key로, 해당 Supervisor에서 실행 중인 Group 목록(Set) 을 value로 담는 Map
+        Map<String, Set<String>> supervisorToGroups = new HashMap<>();
 
-       for (TopologyDetails topologyDetails : topologies.getTopologies()) {
-           SchedulerAssignment assignment = cluster.getAssignmentById(topologyDetails.getId());
-           if(assignment == null) {
+       for (TopologyDetails topologyDetails : topologies.getTopologies()) { // 현재 Cluster에 존재하는 모든 Topology (실행,대기 포함)
+           SchedulerAssignment assignment = cluster.getAssignmentById(topologyDetails.getId()); // 해당 Topology가 실제로 어떤 Supervisor와 WorkerSlot에 할당되어 있는지 조회
+           if(assignment == null) { // 아직 스케줄링이 안된 Topology는 건너뜀
                LOG.info("[SKIP] Topology {} is not yet scheduled, skipping for supervisor-group mapping.", topologyDetails.getName());
                continue;
            }
-
            String group = extractGroup(topologyDetails.getName());
 
-           for (WorkerSlot slot : assignment.getExecutorToSlot().values()) {
-               String supervisorId = slot.getNodeId();
-               supervisorToGroups.computeIfAbsent(supervisorId, k -> new HashSet<>()).add(group);
+           for (WorkerSlot slot : assignment.getExecutorToSlot().values()) { // Executor별로 할당된 WorkerSlot 정보 반환
+               String supervisorId = slot.getNodeId(); //Slot 단위로 어떤 Supervisor에서 실행 중인지 확인
+               supervisorToGroups
+                       .computeIfAbsent(supervisorId, k -> new HashSet<>())
+                       .add(group);
            }
        }
        return supervisorToGroups;
     }
-
 }
