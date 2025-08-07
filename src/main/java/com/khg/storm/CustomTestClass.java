@@ -34,6 +34,9 @@ public class CustomTestClass implements IScheduler {
          * ResourceAwareScheduler: CPU, 메모리, 디스크 사용량 등을 고려해서 배치
          * ResourceAwareScheduler를 사용하여 위임(delegate) 용도로 사용
          */
+        conf.put("blacklist.scheduler.enable", false); // 안전하게 재확인
+        conf.put("blacklist.scheduler.assume.supervisor.bad.based.on.bad.slot", false);
+
         delegate = new ResourceAwareScheduler();
         delegate.prepare(conf,metricsRegistry);
     }
@@ -61,10 +64,8 @@ public class CustomTestClass implements IScheduler {
             String topologyName = topology.getName();
             String group = extractGroup(topologyName);
 
-            if (group == null) {
-                LOG.info("Group name couldn't be determined for topology: {}, skipping.", topologyName);
-                continue;
-            }
+            // 그룹이 없으면, 그룹 제약을 적용하지 않되, 직접 slot에 균등 분산하는 로직을 사용
+            boolean applyGroupConstraint = (group != null);
 
             // Supervisor 별 실행 중인 그룹 맵핑
             Map<String, Set<String>> supervisorToGroups = getSupervisorToGroups(cluster, topologies);
@@ -72,11 +73,10 @@ public class CustomTestClass implements IScheduler {
             // 해당 그룹이 아직 실행되지 않은 Supervisor만 필터
             List<SupervisorDetails> candidateSupervisors = cluster.getSupervisors().values().stream()    // 현재 클러스터의 모든 Supervisor 객체들을 가져옴
                     .filter(s -> {
-                        Set<String> groups =  supervisorToGroups.get(s.getId()); // 현재 Supervisor가 실행중인 group 목록 가져오기
-                        if(groups == null) { // supervisorToGroups에 해당 supervisor가 없다면 아직 아무 group도 실행 안한 supervisor
-                            groups = new HashSet<>(); // 빈 Set으로 처리 (null 방지)
-                        }
-                        return !groups.contains(group); // 현재 스케줄링할 topology에 group이 이미 실행중인지 확인, 없으면 후보군으로 인정
+                        if (!applyGroupConstraint) return true; // 그룹 제약 안할 경우 모든 supervisor 사용
+
+                        Set<String> groups = supervisorToGroups.getOrDefault(s.getId(), Collections.emptySet());
+                        return !groups.contains(group);
                     })
                     .collect(Collectors.toList()); // 조건을 만족하는 Supervisoir들만 리스트로 수집
 
