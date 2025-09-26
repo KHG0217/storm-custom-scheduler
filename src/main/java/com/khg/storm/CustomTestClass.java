@@ -69,14 +69,15 @@ public class CustomTestClass implements IScheduler {
 
             // Supervisor 별 실행 중인 그룹 맵핑
             Map<String, Set<String>> supervisorToGroups = getSupervisorToGroups(cluster, topologies);
+            LOG.info(supervisorToGroups.entrySet().toString());
 
-            // 해당 그룹이 아직 실행되지 않은 Supervisor만 필터
+            // 현재 토폴로지를 배치할 수 있는 후보 Supervisor 목록
             List<SupervisorDetails> candidateSupervisors = cluster.getSupervisors().values().stream()    // 현재 클러스터의 모든 Supervisor 객체들을 가져옴
                     .filter(s -> {
                         if (!applyGroupConstraint) return true; // 그룹 제약 안할 경우 모든 supervisor 사용
-
+                        // 해당 Supervisor가 실행 중인 그룹 목록을 가져오되, 없으면 빈 Set으로 간주한다.
                         Set<String> groups = supervisorToGroups.getOrDefault(s.getId(), Collections.emptySet());
-                        return !groups.contains(group);
+                        return !groups.contains(group); // 같은 그룹 이미 배치된 Supervisor 제외
                     })
                     .collect(Collectors.toList()); // 조건을 만족하는 Supervisoir들만 리스트로 수집
 
@@ -87,7 +88,7 @@ public class CustomTestClass implements IScheduler {
             LOG.info("candidateSupervisors: ");
             candidateSupervisors.forEach(k -> LOG.info("Supervisor: {}",k));
 
-            // 중복 방지용 Set 추가
+            // 스케줄링 도중 할당된 Supervisor추적 및 중복 여부 확인을 위한 Set
             Set<String> assignedSupervisors = new HashSet<>();
 
             // 가능한 Superviosr 중에서 free slot이 있는 Superviosr만 추출
@@ -117,6 +118,7 @@ public class CustomTestClass implements IScheduler {
                 LOG.info("No free worker slots for group: {}, topology: {}", group, topologyName);
                 continue;
             }
+
             try {
                 /**
                  * cluster.getNeedsSchedulingComponentToExecutors(topology)
@@ -138,19 +140,24 @@ public class CustomTestClass implements IScheduler {
                 int targetWorkerCount = topology.getNumWorkers(); // topology에 단긴 worker수
                 LOG.info("targetWorkerCount: " + targetWorkerCount);
 
-                /**
-                 * componet 필드별로 perworker할당
-                 */
-                Map<String ,Integer> perWorkerCount = new HashMap<>();
-                for(Map.Entry<String, Queue<ExecutorDetails>> entry : componentQueues.entrySet()) {
-                    String component = entry.getKey();
-                    int totalExecutors = entry.getValue().size();
+                Map<ExecutorDetails, String> execToComponent = topology.getExecutorToComponent();
+                // componentQueues 기준으로 perWorker 계산
+                Map<String, Integer> perWorkerCount = new HashMap<>(); // exectorName, executor당 배치될 수
+                for (String component : componentQueues.keySet()) {
+                    // component에 해당하는 전체 executor 수 계산
+                    long totalExecutors = execToComponent.values().stream()
+                            .filter(comp -> comp.equals(component))
+                            .count();
                     int perWorker = (int) Math.ceil((double) totalExecutors / targetWorkerCount);
                     perWorkerCount.put(component, perWorker);
-                    LOG.info("perWorkerCount: {}", perWorkerCount.entrySet());
+                    LOG.info("perWorkerCount: {} = {}", component, perWorker);
                 }
 
-                // Supervisor 기준으로 묶기
+                /**
+                 * Supervisor 기준으로 묶기
+                 * key: Supervisor ID
+                 * value: 해당 Supervisor의 사용 가능한 WorkerSlot 목록
+                 */
                 Map<String, List<WorkerSlot>> supervisorToSlots = new HashMap<>();
                 for (WorkerSlot slot : availableSlots) {
                     supervisorToSlots.computeIfAbsent(slot.getNodeId(), k -> new ArrayList<>()).add(slot);
@@ -195,6 +202,7 @@ public class CustomTestClass implements IScheduler {
                          * 재스케줄링을 시도하는 주기(초 단위). 워커가 부족하면 N초마다 반복 시도
                          *
                          */
+                        // 각 요소를 변환하는 Stream 함수형 연산
                         .map(slots -> slots.get(0)) // 각 supervisor에서 첫 번째 슬롯만
                         .collect(Collectors.toList());
                 LOG.info("selectedSlots: " + selectedSlots);
@@ -203,9 +211,9 @@ public class CustomTestClass implements IScheduler {
                     List<ExecutorDetails> executorList = new ArrayList<>();
 
                     for(Map.Entry<String, Queue<ExecutorDetails>> entry : componentQueues.entrySet()) {
-                        String component = entry.getKey();
+                        String component = entry.getKey(); // ex) bolt1
                         LOG.info("component: " + component);
-                        Queue<ExecutorDetails> queue = entry.getValue();
+                        Queue<ExecutorDetails> queue = entry.getValue(); // [[3,3]]
                         LOG.info("queue: " + queue);
                         int perWorker = perWorkerCount.getOrDefault(component, 1);
 
@@ -251,6 +259,8 @@ public class CustomTestClass implements IScheduler {
      *
      * 동일 그룹 Topology가 이미 특정 Supervisor에서 실행 중인 경우
      * 새로운 Topology를 해당 Supervisor에 배치하지 않도록 판단 근거로 활용
+     * key: supervisorID, value: group
+     * ex) [55200935-3a72-47cc-9b1c-3b7a5e39d8aa-10.34.32.189=[youtube]]
      * @param cluster
      * @param topologies
      * @return
